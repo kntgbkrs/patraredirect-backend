@@ -112,6 +112,10 @@ function doPost(e) {
   try {
     const raw = (e && e.postData && e.postData.contents) || '{}';
     body = JSON.parse(raw);
+    if (body.action === 'login' && !staffGateOk_(body.gate)) {
+      return ContentService.createTextOutput(JSON.stringify({ success: false, code: 'AUTH', message: 'Username atau kata sandi salah.' }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
   } catch (err) {
     return jsonOut_({ success: false, code: 'BAD_JSON', message: 'Format request JSON tidak valid.' });
   }
@@ -1315,4 +1319,15 @@ function changeOwnPassword(token, oldPw, newPw) {
       return null;
     });
   });
+}
+
+/** Pintu Login Petugas — kunci disimpan di Properti skrip: STAFF_GATE_KEY */
+function staffGateOk_(gate) {
+  var key = PropertiesService.getScriptProperties().getProperty('STAFF_GATE_KEY');
+  if (!key) return true;
+  gate = String(gate || '');
+  if (gate.length !== key.length) return false;
+  var diff = 0;
+  for (var i = 0; i < key.length; i++) diff |= key.charCodeAt(i) ^ gate.charCodeAt(i);
+  return diff === 0;
 }
