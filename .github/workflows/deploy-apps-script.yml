@@ -1,0 +1,39 @@
+# Setiap merge ke main: kirim Kode.js + appsscript.json ke Google Apps Script,
+# lalu perbarui deployment web app yang sudah ada (alamat /exec tetap sama).
+# Butuh secret repo CLASPRC_JSON — cara membuatnya ada di README.md.
+name: Deploy ke Apps Script
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-apps-script
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Push & deploy
+        env:
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+          # ID deployment web app = bagian AKfycb… di GAS_URL frontend (js/config.js); memang publik.
+          DEPLOYMENT_ID: AKfycbxRisaq29_BatlcEoGWQQ0OojyTsX1suRuty18vMP-OZ8K14dOuo4Vb9YBDFMOrFjKDng
+        run: |
+          if [ -z "$CLASPRC_JSON" ]; then
+            echo "::warning::Secret CLASPRC_JSON belum diisi, deploy dilewati. Lihat README.md."
+            exit 0
+          fi
+          printf '%s' "$CLASPRC_JSON" > ~/.clasprc.json
+          npx -y @google/clasp@3.4.1 push --force
+          npx -y @google/clasp@3.4.1 update-deployment "$DEPLOYMENT_ID" --description "GitHub ${GITHUB_SHA::7}"
