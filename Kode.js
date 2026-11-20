@@ -34,6 +34,9 @@ const CARD_TTL = 1800;             // cache data kartu publik: 30 menit
 const HASH_ROUNDS = 150;
 const PIN_MAX_FAIL = 5;
 const LOCK_SEC = 900;              // kunci sementara 15 menit
+const PIN_MAX_FAIL_LONG = 10;      // batas salah PIN per kartu dalam 6 jam
+const LOCK_LONG_SEC = 21600;       // 6 jam (batas maksimal CacheService)
+const SCAN_GAP_SEC = 10;           // satu kartu dihitung maksimal 1 scan per 10 detik
 const DAY_MS = 86400000;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
 const DAYS_S = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'];
@@ -427,20 +430,26 @@ function log_(actor, aksi, code, detail) {
 /** Catat scan ke antrian cache (milidetik). Ditulis ke Sheets secara batch oleh flushScanQueue(). */
 function queueScan_(code, ok) {
   const evt = [Date.now(), code, ok ? 1 : 0];
+  const cache = CacheService.getScriptCache();
+  const sk = 'sl:' + code;                          // penanda "baru dihitung": cegah penggelembungan jumlah scan
   try {
     const lock = LockService.getScriptLock();
     if (lock.tryLock(1500)) {
       try {
-        const cache = CacheService.getScriptCache();
+        if (cache.get(sk)) return;
         const raw = cache.get('scanq');
         const q = raw ? JSON.parse(raw) : [];
         q.push(evt);
         cache.put('scanq', JSON.stringify(q), 21600);
+        cache.put(sk, '1', SCAN_GAP_SEC);
       } finally { lock.releaseLock(); }
       return;
     }
   } catch (e) { logErr_(e); }
   // Cadangan bila lock penuh: tulis langsung ke log (hitungan kartu menyusul dari laporan)
+  // shortcut: cek di jalur ini tanpa lock, scan yang benar-benar bersamaan bisa lolos beberapa; cukup agar sheet tidak membengkak.
+  if (cache.get(sk)) return;
+  cache.put(sk, '1', SCAN_GAP_SEC);
   try {
     getSS_().getSheetByName(SHEET.LOG).appendRow([new Date(evt[0]), code, ok ? 'berhasil' : 'ditolak']);
   } catch (e) { logErr_(e); }
@@ -681,22 +690,32 @@ function verifyPin(code, pin) {
     code = normCode_(code);
     if (!code) throw uerr_('Kode kartu tidak valid.');
     const cache = CacheService.getScriptCache();
-    const fk = 'pf:' + code;
-    const fails = Number(cache.get(fk) || 0);
-    if (fails >= PIN_MAX_FAIL) throw uerr_('Terlalu banyak percobaan. Coba lagi dalam 15 menit.', 'LOCKED');
+    const fk = 'pf:' + code, dk = 'pd:' + code;
     pin = String(pin || '');
     const c = /^\d{4,6}$/.test(pin) ? cardRowOrNull_(code) : null;
     if (c && c.o.status === 'belum_setup') throw uerr_('Kartu ini belum diregistrasi.', 'UNREG');
     if (c && c.o.status === 'nonaktif') throw uerr_('Kartu ini sedang nonaktif. Hubungi admin.', 'INACTIVE');
+    // Jatah percobaan diambil di dalam lock SEBELUM PIN diperiksa, jadi tebakan serentak tidak bisa melewati batas.
+    // shortcut: penghitung di CacheService (maks. 6 jam, bisa terhapus lebih awal); pindah ke Sheet bila perlu kunci permanen.
+    const f = withLock_(function () {
+      const n = Number(cache.get(fk) || 0), d = Number(cache.get(dk) || 0);
+      if (n < PIN_MAX_FAIL && d < PIN_MAX_FAIL_LONG) {
+        cache.put(fk, String(n + 1), LOCK_SEC);
+        cache.put(dk, String(d + 1), LOCK_LONG_SEC);
+      }
+      return { n: n, d: d };
+    });
+    if (f.d >= PIN_MAX_FAIL_LONG) throw uerr_('Terlalu banyak percobaan. Coba lagi dalam 6 jam.', 'LOCKED');
+    if (f.n >= PIN_MAX_FAIL) throw uerr_('Terlalu banyak percobaan. Coba lagi dalam 15 menit.', 'LOCKED');
     const ok = !!(c && verifySecret_(pin, c.o.pin_hash));
     if (!ok) {
       if (!c) hashSecret_(pin, 'x');                    // samakan waktu respons
-      cache.put(fk, String(fails + 1), LOCK_SEC);
-      const left = PIN_MAX_FAIL - (fails + 1);
-      if (left <= 0) throw uerr_('Terlalu banyak percobaan. Coba lagi dalam 15 menit.', 'LOCKED');
+      const leftShort = PIN_MAX_FAIL - (f.n + 1), leftLong = PIN_MAX_FAIL_LONG - (f.d + 1);
+      const left = Math.min(leftShort, leftLong);
+      if (left <= 0) throw uerr_('Terlalu banyak percobaan. Coba lagi dalam ' + (leftLong <= 0 ? '6 jam.' : '15 menit.'), 'LOCKED');
       throw uerr_('PIN salah. Sisa ' + left + ' percobaan.', 'BADPIN');
     }
-    cache.remove(fk);
+    cache.removeAll([fk, dk]);
     const token = Utilities.getUuid();
     cache.put('ct:' + token, JSON.stringify({ code: code }), 900);
     return { token: token, card: ownerCard_(c.o) };
@@ -762,7 +781,7 @@ function resetCard_(code, actor) {
     c.sh.getRange(c.row, 2, 1, 10).setValues([['belum_setup', '', '', '', '', '', '', '', 0, '']]);
     invalidateCard_(code);
     invalidateStats_();
-    CacheService.getScriptCache().remove('pf:' + code);
+    CacheService.getScriptCache().removeAll(['pf:' + code, 'pd:' + code]);
     log_(actor, 'reset_kartu', code, '');
   });
 }
